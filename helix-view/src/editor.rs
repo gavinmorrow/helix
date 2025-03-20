@@ -1,10 +1,12 @@
 use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     clipboard::ClipboardProvider,
+    diagnostic::DiagnosticProvider,
     document::{
-        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+        self, DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode,
+        SavePoint,
     },
-    events::DocumentFocusLost,
+    events::{DiagnosticsDidChange, DocumentFocusLost},
     graphics::{CursorKind, Rect},
     handlers::Handlers,
     info::Info,
@@ -12,7 +14,7 @@ use crate::{
     register::Registers,
     theme::{self, Theme},
     tree::{self, Tree},
-    Document, DocumentId, View, ViewId,
+    Diagnostic, Document, DocumentId, View, ViewId,
 };
 use dap::StackFrame;
 use helix_event::dispatch;
@@ -48,7 +50,6 @@ use helix_core::{
     Change, LineEnding, Position, Range, Selection, Uri, NATIVE_LINE_ENDING,
 };
 use helix_dap as dap;
-use helix_lsp::lsp;
 use helix_stdx::path::canonicalize;
 
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
@@ -1036,6 +1037,8 @@ pub struct Breakpoint {
 
 use futures_util::stream::{Flatten, Once};
 
+type Diagnostics = BTreeMap<Uri, Vec<Diagnostic>>;
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
@@ -1055,7 +1058,7 @@ pub struct Editor {
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
-    pub diagnostics: BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
+    pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
 
     pub debugger: Option<dap::Client>,
@@ -1202,7 +1205,7 @@ impl Editor {
             macro_replaying: Vec::new(),
             theme: theme_loader.default(),
             language_servers,
-            diagnostics: BTreeMap::new(),
+            diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
             debugger: None,
             debugger_events: SelectAll::new(),
@@ -1722,7 +1725,7 @@ impl Editor {
     }
 
     pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
-        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+        let (stdin, encoding, has_bom) = document::read_to_string(&mut stdin(), None)?;
         let doc = Document::from(
             helix_core::Rope::default(),
             Some((encoding, has_bom)),
@@ -1998,48 +2001,50 @@ impl Editor {
     /// Returns all supported diagnostics for the document
     pub fn doc_diagnostics<'a>(
         language_servers: &'a helix_lsp::Registry,
-        diagnostics: &'a BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
+        diagnostics: &'a Diagnostics,
         document: &Document,
-    ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
-        Editor::doc_diagnostics_with_filter(language_servers, diagnostics, document, |_, _| true)
+    ) -> impl Iterator<Item = document::Diagnostic> + 'a {
+        Editor::doc_diagnostics_with_filter(language_servers, diagnostics, document, |_| true)
     }
 
     /// Returns all supported diagnostics for the document
     /// filtered by `filter` which is invocated with the raw `lsp::Diagnostic` and the language server id it came from
     pub fn doc_diagnostics_with_filter<'a>(
         language_servers: &'a helix_lsp::Registry,
-        diagnostics: &'a BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
+        diagnostics: &'a Diagnostics,
         document: &Document,
-        filter: impl Fn(&lsp::Diagnostic, LanguageServerId) -> bool + 'a,
-    ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
+        filter: impl Fn(&Diagnostic) -> bool + 'a,
+    ) -> impl Iterator<Item = document::Diagnostic> + 'a {
         let text = document.text().clone();
         let language_config = document.language.clone();
         diagnostics
             .get(&document.uri())
             .map(|diags| {
-                diags.iter().filter_map(move |(diagnostic, lsp_id)| {
-                    let ls = language_servers.get_by_id(*lsp_id)?;
-                    language_config
-                        .as_ref()
-                        .and_then(|c| {
-                            c.language_servers.iter().find(|features| {
-                                features.name == ls.name()
-                                    && features.has_feature(LanguageServerFeature::Diagnostics)
-                            })
-                        })
-                        .and_then(|_| {
-                            if filter(diagnostic, *lsp_id) {
-                                Document::lsp_diagnostic_to_diagnostic(
-                                    &text,
-                                    language_config.as_deref(),
-                                    diagnostic,
-                                    *lsp_id,
-                                    ls.offset_encoding(),
-                                )
-                            } else {
-                                None
-                            }
-                        })
+                diags.iter().filter_map(move |diagnostic| {
+                    let language_server = diagnostic
+                        .provider
+                        .language_server_id()
+                        .and_then(|id| language_servers.get_by_id(id));
+
+                    if let Some((config, server)) = language_config.as_ref().zip(language_server) {
+                        config.language_servers.iter().find(|features| {
+                            features.name == server.name()
+                                && features.has_feature(LanguageServerFeature::Diagnostics)
+                        })?;
+                    }
+                    if diagnostic.severity.is_some_and(|severity| {
+                        language_config
+                            .as_ref()
+                            .is_some_and(|config| severity < config.diagnostic_severity)
+                    }) {
+                        return None;
+                    }
+
+                    if filter(diagnostic) {
+                        diagnostic.to_document_diagnostic(&text)
+                    } else {
+                        None
+                    }
                 })
             })
             .into_iter()
@@ -2219,6 +2224,84 @@ impl Editor {
 
     pub fn get_last_cwd(&mut self) -> Option<&Path> {
         self.last_cwd.as_deref()
+    }
+
+    pub fn handle_diagnostics(
+        &mut self,
+        provider: DiagnosticProvider,
+        uri: Uri,
+        version: Option<i32>,
+        mut diagnostics: Vec<Diagnostic>,
+    ) {
+        use std::collections::btree_map::Entry;
+
+        let doc = self.documents.values_mut().find(|doc| doc.uri() == uri);
+
+        if let Some((version, doc)) = version.zip(doc.as_ref()) {
+            if version != doc.version() {
+                log::info!("Version ({version}) is out of date for {uri:?} (expected ({})), dropping diagnostics", doc.version());
+                return;
+            }
+        }
+
+        let mut unchanged_diag_sources = Vec::new();
+        if let Some((lang_conf, old_diagnostics)) = doc
+            .as_ref()
+            .and_then(|doc| Some((doc.language_config()?, self.diagnostics.get(&uri)?)))
+        {
+            if !lang_conf.persistent_diagnostic_sources.is_empty() {
+                diagnostics.sort();
+            }
+            for source in &lang_conf.persistent_diagnostic_sources {
+                let new_diagnostics = diagnostics
+                    .iter()
+                    .filter(|d| d.source.as_ref() == Some(source));
+                let old_diagnostics = old_diagnostics
+                    .iter()
+                    .filter(|d| d.provider == provider && d.source.as_ref() == Some(source));
+                if new_diagnostics.eq(old_diagnostics) {
+                    unchanged_diag_sources.push(source.clone())
+                }
+            }
+        }
+
+        // Insert the original lsp::Diagnostics here because we may have no open document
+        // for diagnostic message and so we can't calculate the exact position.
+        // When using them later in the diagnostics picker, we calculate them on-demand.
+        let diagnostics = match self.diagnostics.entry(uri) {
+            Entry::Occupied(o) => {
+                let current_diagnostics = o.into_mut();
+                // there may entries of other language servers, which is why we can't overwrite the whole entry
+                current_diagnostics.retain(|diagnostic| diagnostic.provider != provider);
+                current_diagnostics.extend(diagnostics);
+                current_diagnostics
+                // Sort diagnostics first by severity and then by line numbers.
+            }
+            Entry::Vacant(v) => v.insert(diagnostics),
+        };
+
+        diagnostics.sort();
+
+        if let Some(doc) = doc {
+            let diagnostic_of_language_server_and_not_in_unchanged_sources =
+                |diagnostic: &crate::Diagnostic| {
+                    diagnostic.provider == provider
+                        && diagnostic
+                            .source
+                            .as_ref()
+                            .map_or(true, |source| !unchanged_diag_sources.contains(source))
+                };
+            let diagnostics = Self::doc_diagnostics_with_filter(
+                &self.language_servers,
+                &self.diagnostics,
+                doc,
+                diagnostic_of_language_server_and_not_in_unchanged_sources,
+            );
+            doc.replace_diagnostics(diagnostics, &unchanged_diag_sources, Some(provider.clone()));
+
+            let doc = doc.id();
+            helix_event::dispatch(DiagnosticsDidChange { editor: self, doc });
+        }
     }
 }
 

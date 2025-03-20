@@ -9,6 +9,7 @@ use helix_lsp::{
 use helix_stdx::path::get_relative_path;
 use helix_view::{
     align_view,
+    diagnostic::DiagnosticProvider,
     document::{DocumentOpenError, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
     graphics::Rect,
@@ -740,12 +741,20 @@ impl Application {
                             log::error!("Discarding publishDiagnostic notification sent by an uninitialized server: {}", language_server.name());
                             return;
                         }
-                        self.editor.handle_lsp_diagnostics(
-                            language_server.id(),
-                            uri,
-                            params.version,
-                            params.diagnostics,
-                        );
+                        let provider = DiagnosticProvider::Lsp(server_id);
+                        let diagnostics = params
+                            .diagnostics
+                            .into_iter()
+                            .map(|diagnostic| {
+                                helix_view::Diagnostic::lsp(
+                                    provider.clone(),
+                                    language_server.offset_encoding(),
+                                    diagnostic,
+                                )
+                            })
+                            .collect();
+                        self.editor
+                            .handle_diagnostics(provider, uri, params.version, diagnostics);
                     }
                     Notification::ShowMessage(params) => {
                         if self.config.load().editor.lsp.display_messages {
@@ -854,14 +863,16 @@ impl Application {
                         // we need to clear those and remove the entries from the list if this leads to
                         // an empty diagnostic list for said files
                         for diags in self.editor.diagnostics.values_mut() {
-                            diags.retain(|(_, lsp_id)| *lsp_id != server_id);
+                            diags.retain(|diag| {
+                                diag.provider.language_server_id() != Some(server_id)
+                            });
                         }
 
                         self.editor.diagnostics.retain(|_, diags| !diags.is_empty());
 
                         // Clear any diagnostics for documents with this server open.
                         for doc in self.editor.documents_mut() {
-                            doc.clear_diagnostics(Some(server_id));
+                            doc.clear_diagnostics_for_server(server_id);
                         }
 
                         // Remove the language server from the registry.

@@ -1622,7 +1622,7 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
         for doc in cx.editor.documents_mut() {
             if let Some(client) = doc.remove_language_server_by_name(ls_name) {
-                doc.clear_diagnostics(Some(client.id()));
+                doc.clear_diagnostics_for_server(client.id());
                 doc.reset_all_inlay_hints();
                 doc.inlay_hints_oudated = true;
             }
@@ -2493,7 +2493,7 @@ fn yank_diagnostic(
         .diagnostics()
         .iter()
         .filter(|d| primary.overlaps(&helix_core::Range::new(d.range.start, d.range.end)))
-        .map(|d| d.message.clone())
+        .map(|d| d.inner.message.clone())
         .collect();
     let n = diag.len();
     if n == 0 {
