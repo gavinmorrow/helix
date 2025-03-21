@@ -215,6 +215,7 @@ impl Editor {
                 }
                 .boxed()
             })
+            .chain(self.spelling_code_actions())
             .collect();
 
         if futures.is_empty() {

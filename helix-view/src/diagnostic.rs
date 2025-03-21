@@ -29,13 +29,14 @@ pub enum DiagnosticTag {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticProvider {
     Lsp(LanguageServerId),
+    Spelling,
 }
 
 impl DiagnosticProvider {
     pub fn language_server_id(&self) -> Option<LanguageServerId> {
         match self {
             Self::Lsp(server_id) => Some(*server_id),
-            // _ => None,
+            _ => None,
         }
     }
 }
